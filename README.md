@@ -180,7 +180,7 @@ Magpie 的插件清单在数据目录的 `plugins.json`。这个包还没发布�
 ```json
 {
   "plugins": [
-    { "spec": "git+https://github.com/2959916298/magpie-meoo-auth.git" }
+    { "spec": "git+https://github.com/q1094/magpie-meoo-auth.git" }
   ]
 }
 ```
@@ -211,7 +211,7 @@ Magpie 的插件清单在数据目录的 `plugins.json`。这个包还没发布�
 
 ```bash
 # 发布到 npm 后按包名加载：opencode.json 的 plugin 里写 "plugin": ["magpie-meoo-auth@latest"]
-# 未发布时用本目录的绝对路径，或 "plugin": ["git+https://github.com/2959916298/magpie-meoo-auth.git"]
+# 未发布时用本目录的绝对路径，或 "plugin": ["git+https://github.com/q1094/magpie-meoo-auth.git"]
 opencode auth login   # 选 Meoo
 ```
 
@@ -271,7 +271,7 @@ node --test --test-isolation=none test/offline.test.mjs test/web.test.mjs
 
 ### 维护
 
-- [2959916298](https://github.com/2959916298)：本分支（`magpie-meoo-auth`）的维护者——多项目手动选择、每日签到、登录态有效期面板。
+- [q1094](https://github.com/q1094)：本分支（`magpie-meoo-auth`）的维护者——多项目手动选择、每日签到、登录态有效期面板。
 
 ### 上游
 

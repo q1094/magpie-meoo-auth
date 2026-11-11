@@ -39,8 +39,8 @@
   ],
   "license": "MIT",
   "author": {
-    "name": "2959916298",
-    "url": "https://github.com/2959916298"
+    "name": "q1094",
+    "url": "https://github.com/q1094"
   },
   "contributors": [
     {
@@ -54,11 +54,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2959916298/magpie-meoo-auth.git"
+    "url": "git+https://github.com/q1094/magpie-meoo-auth.git"
   },
-  "homepage": "https://github.com/2959916298/magpie-meoo-auth#readme",
+  "homepage": "https://github.com/q1094/magpie-meoo-auth#readme",
   "bugs": {
-    "url": "https://github.com/2959916298/magpie-meoo-auth/issues"
+    "url": "https://github.com/q1094/magpie-meoo-auth/issues"
   },
   "publishConfig": {
     "access": "public"
