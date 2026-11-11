@@ -1,0 +1,72 @@
+.meoo-session {
+  font: inherit;
+  color: var(--magpie-fg, inherit);
+}
+
+.meoo-session .head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.meoo-session .big {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.meoo-session .big.warn {
+  color: var(--magpie-accent, #c2410c);
+}
+
+.meoo-session .sub {
+  font-size: 13px;
+  opacity: 0.75;
+}
+
+.meoo-session table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.meoo-session th,
+.meoo-session td {
+  text-align: left;
+  padding: 5px 8px 5px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--magpie-fg, #000) 10%, transparent);
+  white-space: nowrap;
+}
+
+.meoo-session th {
+  font-weight: 500;
+  opacity: 0.65;
+}
+
+.meoo-session td.name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.meoo-session td.num {
+  text-align: right;
+  padding-right: 0;
+}
+
+.meoo-session tr.expired td.num {
+  color: var(--magpie-accent, #c2410c);
+}
+
+.meoo-session .hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.meoo-session .muted {
+  opacity: 0.7;
+  margin: 0;
+}

@@ -19,13 +19,15 @@
 
 import { createHash, randomBytes } from "node:crypto"
 import { createServer } from "node:http"
-import { readFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { checkinViaWeb, cookieExpiry, cookieExpiryViaBrowser, formatLocal, formatRemain, openBrowserWindow } from "./web.mjs"
 
 const PROVIDER_ID = "meoo"
 // 外层显示名：Magpie 的插件/供应商列表里露出来的就是这一条短名 "Meoo"；
-// 点进去看到的完整包名来自宿主读到的插件 spec —— @fish-under-sea/opencode-meoo-auth。
+// 点进去看到的完整包名来自宿主读到的插件 spec —— magpie-meoo-auth。
 const PROVIDER_NAME = "Meoo"
 // 账号记录里没有用户名时的兜底称呼，保留中文全名，免得两个 Meoo 混淆。
 const ACCOUNT_FALLBACK = "Meoo 秒悟"
@@ -341,7 +343,10 @@ async function pickProject(ctx, a, explicitUrlId) {
     return only
   }
   const options = projects.map((p) => `${p.url_id || p.urlId}（${p.name || "未命名"}）`).join("、")
-  const err = new Error(`账号下有多个项目，请改用「项目服务 AK」登录方式并指定项目，或先在 meoo.com 设为默认项目。可选：${options}`)
+  const err = new Error(
+    `账号下有多个项目，无法自动确定项目服务 AK 的归属。浏览器登录时回调页会列出项目让你选一个；也可以改用「项目服务 AK」登录方式直接指定。可选：${options}`,
+  )
+  err.code = "MULTIPLE_PROJECTS"
   err.projects = projects
   throw err
 }
@@ -363,7 +368,7 @@ async function resolveServiceAk(ctx, a, { projectUrlId } = {}) {
   if (!ak) {
     try {
       await controlRequest(ctx, a, "POST", `/open/v1/cli-compat/projects/${encodeURIComponent(urlId)}/cloud`, {
-        description: "opencode-meoo-auth: AI 服务",
+        description: "magpie-meoo-auth: AI 服务",
       })
       const env = await controlRequest(ctx, a, "GET", envPath)
       ak = env?.meooProjectApiKey || env?.instance?.meooProjectApiKey || null
@@ -535,13 +540,11 @@ function runtimeModel(provider, m) {
 
 // ---- 登录 -------------------------------------------------------------------
 
-/**
- * 登录成功后的账号记录：token + 控制面解析出的身份/项目/AK，一起交给宿主保存。
- */
-async function buildSignedInAuth(tokens, apiBase) {
+/** 换到的 token → 账号记录（后续所有 result 都从这里派生）。 */
+function authFromTokens(tokens, apiBase) {
   const access = tokens.access_token
   if (!access) throw new Error("OAuth 响应里没有 access_token")
-  const a = {
+  return {
     apiBase: apiBase.replace(/\/+$/, ""),
     access,
     refresh: tokens.refresh_token || "",
@@ -549,14 +552,10 @@ async function buildSignedInAuth(tokens, apiBase) {
     ...(tokens.scope ? { scope: tokens.scope } : {}),
     ...(tokens.openid ? { openid: tokens.openid } : {}),
   }
-  const me = await controlCall(apiBase, access, "GET", "/open/v1/cli-compat/account/identity")
-  if (me?.name) a.username = me.name
-  if (me?.user_id) a.userId = me.user_id
-  if (me?.project_url_id || me?.projectUrlId) a.projectUrlId = me.project_url_id || me.projectUrlId
-  const { urlId, ak } = await resolveServiceAk({ client: null }, a)
-  a.projectUrlId = urlId
-  a.serviceAk = ak
-  a.serviceAkProjectId = urlId
+}
+
+/** 账号记录 → 宿主 auth 成功结果。 */
+function successOf(a) {
   return {
     type: "success",
     access: a.access,
@@ -574,7 +573,81 @@ async function buildSignedInAuth(tokens, apiBase) {
   }
 }
 
-/** 方式一：浏览器 PKCE 授权，本机 loopback 自动收回调，AK 全自动解析。 */
+/**
+ * 换票后的完整链路：身份 → 项目 → 云服务 AK，产出宿主可直接保存的账号记录。
+ *
+ * `projectUrlId` 可显式指定（浏览器回调页里选的那一个）。没指定且账号下多个项目时，
+ * 抛的错上带 `projects`（以及已解析的身份 `me`），由调用方决定是让用户选还是报错。
+ */
+async function buildSignedInAuth(tokens, apiBase, { projectUrlId } = {}) {
+  const a = authFromTokens(tokens, apiBase)
+  const me = await controlCall(apiBase, a.access, "GET", "/open/v1/cli-compat/account/identity")
+  if (me?.name) a.username = me.name
+  if (me?.user_id) a.userId = me.user_id
+  a.projectUrlId = projectUrlId || me?.project_url_id || me?.projectUrlId || ""
+  try {
+    const { urlId, ak } = await resolveServiceAk({ client: null }, a, { projectUrlId: a.projectUrlId })
+    a.projectUrlId = urlId
+    a.serviceAk = ak
+    a.serviceAkProjectId = urlId
+  } catch (e) {
+    // 多项目歧义要冒泡给调用方去问用户，顺带把身份带出去（选择页要显示用户名）
+    if (e && typeof e === "object") e.me = me
+    throw e
+  }
+  return successOf(a)
+}
+
+const escapeHtml = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
+
+/**
+ * 多项目选择页：授权已经完成，但 AK 挂在项目上（计费也归项目），不能替用户决定。
+ * 直接在这一页点选项目或贴一个项目 id，选完由同一个 loopback 请求继续取 AK ——
+ * 不用回 Magpie 重新走一遍登录（以前这里直接报错，回去重试还是同一条错）。
+ */
+function renderProjectPicker({ projects, username, token, error = "" }) {
+  const rows = (Array.isArray(projects) ? projects : [])
+    .map((p) => {
+      const id = String(p?.url_id || p?.urlId || "")
+      if (!id) return ""
+      const name = String(p?.name || "未命名")
+      return `<label class="row"><input type="radio" name="project" value="${escapeHtml(id)}"><span class="name">${escapeHtml(name)}</span><code>${escapeHtml(id)}</code></label>`
+    })
+    .join("")
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>选择 Meoo 项目</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body { font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 40px 20px; background: #f6f7f9; color: #1c1e21 }
+ main { max-width: 760px; margin: 0 auto; background: #fff; border-radius: 14px; padding: 28px 32px; box-shadow: 0 1px 3px rgba(0,0,0,.08) }
+ h1 { font-size: 20px; margin: 0 0 8px }
+ p { margin: 0 0 16px; color: #4b4f56 }
+ .warn { background: #fff4f2; border: 1px solid #ffd6cc; color: #a3321b; padding: 10px 12px; border-radius: 8px; margin-bottom: 16px }
+ .row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #e3e5e8; border-radius: 10px; margin-bottom: 8px; cursor: pointer }
+ .row:hover { border-color: #b9c0c7; background: #fafbfc }
+ .row input { margin: 0; flex: none }
+ .row .name { font-weight: 600 }
+ .row code { margin-left: auto; color: #6b7280; font-size: 12px }
+ .custom { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap }
+ .custom input { flex: 1 1 260px; padding: 9px 10px; border: 1px solid #d7dbe0; border-radius: 8px; font: inherit }
+ button { padding: 10px 18px; border: 0; border-radius: 9px; background: #1c1e21; color: #fff; font: inherit; cursor: pointer }
+ button:hover { opacity: .9 }
+ .hint { margin-top: 18px; font-size: 13px; color: #6b7280 }
+</style></head><body><main>
+<h1>选择一个项目</h1>
+<p>${escapeHtml(username || "该账号")} 下有 ${(Array.isArray(projects) ? projects : []).length} 个项目。项目服务 AK 挂在项目上、计费也归属项目，所以这一步得由你指定。</p>
+${error ? `<div class="warn">${escapeHtml(error)}</div>` : ""}
+<form method="POST" action="${CALLBACK_PATH}">
+<input type="hidden" name="state" value="${escapeHtml(token)}">
+${rows}
+<div class="custom"><input name="custom" placeholder="或粘贴项目 id（如 proj-a1b2c3d4）" autocomplete="off" spellcheck="false"><button type="submit">用这个项目登录</button></div>
+</form>
+<p class="hint">项目 id 就是 meoo.com 项目地址里 <code>/p/&lt;id&gt;</code> 那一段。选完这个页面会完成登录，回到 Magpie 即已连上；换项目就重新登录一次再选。</p>
+</main></body></html>`
+}
+
+/** 方式一：浏览器 PKCE 授权，本机 loopback 自动收回调；多项目时在回调页里选一次。 */
 async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
   const apiBase = mainOrigin()
   const clientId = clientIdFor(apiBase)
@@ -583,6 +656,7 @@ async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
   const state = randomBytes(32).toString("base64url")
 
   let complete, timer, origin, received = false, settled = false
+  let pending = null // 授权已完成、但等用户选项目：{ tokens, me, projects }
   const done = new Promise((resolve) => {
     complete = resolve
   })
@@ -594,21 +668,75 @@ async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
     server.close()
     server.closeIdleConnections?.()
   }
+  // 等用户选项目时从那一刻重新计时，不占用「授权等待」剩下的秒数
+  const arm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(
+      () => finish({ type: "failed", error: pending ? "Meoo 登录超时（项目还没选），请重新登录" : "Meoo 登录超时，请重新登录" }),
+      timeoutMs,
+    )
+    timer.unref?.()
+  }
+  const readBody = (req) =>
+    new Promise((resolve) => {
+      let size = 0
+      const chunks = []
+      req.on("data", (c) => {
+        size += c.length
+        if (size > 32 * 1024) {
+          req.destroy()
+          resolve("")
+          return
+        }
+        chunks.push(c)
+      })
+      req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+      req.on("error", () => resolve(""))
+    })
   const server = createServer(async (req, res) => {
-    const reply = (status, text) => {
+    const reply = (status, text, html = false) => {
       res.writeHead(status, {
-        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Type": html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
         "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'none'",
+        "Content-Security-Policy": html ? "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'" : "default-src 'none'",
       })
       res.end(text)
     }
+    const picker = (error = "") =>
+      reply(
+        200,
+        renderProjectPicker({ projects: pending?.projects, username: pending?.me?.name, token: state, error }),
+        true,
+      )
     const url = new URL(req.url || "/", "http://127.0.0.1")
     if (req.headers.host !== origin || url.pathname !== CALLBACK_PATH) return reply(404, "Not found")
+
+    // 选项目：同一个 loopback 端口上收表单，接着把 AK 取完
+    if (req.method === "POST") {
+      const form = new URLSearchParams(await readBody(req))
+      if (form.get("state") !== state) return reply(400, "这次选择不属于本次登录，请回到原授权页重试。")
+      if (settled) return reply(409, "本次登录已经结束，请回到 Magpie 查看结果。")
+      if (!pending) return reply(409, "本次登录没有待选的项目，请回到 Magpie 重新登录。")
+      const wanted = String(form.get("custom") || "").trim() || String(form.get("project") || "").trim()
+      if (!wanted) return picker("请先在列表里选一个项目，或填一个项目 id。")
+      try {
+        const success = await buildSignedInAuth(pending.tokens, pending.apiBase, { projectUrlId: wanted })
+        if (settled) return reply(408, "登录已超时，请回到 Magpie 重新登录。")
+        reply(200, `Meoo 登录成功，已用项目 ${wanted} 取得 AK，可以关闭这个页面回到 Magpie。`)
+        finish(success)
+      } catch (e) {
+        // 项目没开通云服务 / 配额满了之类：留在选择页，换一个项目再试，不用重走登录
+        return picker(`项目 ${wanted} 没能取到 AK：${e?.message ?? String(e)}`)
+      }
+      return
+    }
     if (req.method !== "GET") return reply(405, "Method not allowed")
+
     const q = url.searchParams
     if (q.getAll("state").length !== 1 || q.get("state") !== state) return reply(400, "回调不属于本次登录，请回到原授权页重试。")
+    // 已拿到 token 在等选项目：刷新这一页就重新给选择页，不当成重复回调
+    if (pending && !settled) return picker("")
     if (settled || received) return reply(409, "本次回调已经处理，请回到 Magpie 查看结果。")
     if (q.get("error")) {
       reply(400, "登录未获授权，请回到 Magpie 重新登录。")
@@ -626,7 +754,16 @@ async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
         redirect_uri: `http://${origin}${CALLBACK_PATH}`,
         code_verifier: verifier,
       })
-      const success = await buildSignedInAuth(tokens, apiBase)
+      let success
+      try {
+        success = await buildSignedInAuth(tokens, apiBase)
+      } catch (e) {
+        // 纯多项目歧义：不是错误，是要用户补一步「选哪个项目」
+        if (!e?.projects?.length) throw e
+        pending = { tokens, apiBase, me: e.me ?? null, projects: e.projects }
+        arm()
+        return picker("")
+      }
       if (settled) return reply(408, "登录已超时，请回到 Magpie 重新登录。")
       reply(200, "Meoo 登录成功，可以关闭这个页面回到 Magpie。")
       finish(success)
@@ -649,14 +786,23 @@ async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
   authorize.searchParams.set("state", state)
   authorize.searchParams.set("code_challenge", challenge)
   authorize.searchParams.set("code_challenge_method", "S256")
-  timer = setTimeout(() => finish({ type: "failed", error: "Meoo 登录超时，请重新登录" }), timeoutMs)
-  timer.unref?.()
+  arm()
+  // 优先用受控浏览器（插件自己的持久 profile）打开授权页：登录一次，OAuth 回调与
+  // meoo.com 的网页会话（每日签到要用）都落进同一个 profile；打不开才回退成宿主
+  // 打开系统浏览器——那种情况下 cookie 留在用户日常浏览器里，签到会用不了。
+  const opener = await openBrowserWindow(authorize.toString())
   return {
-    url: authorize.toString(),
-    instructions: "在浏览器登录 Meoo 并点一次「授权」后，会自动返回此处；项目和 AI 服务 AK 都会自动解析。",
+    url: opener.ok ? "" : authorize.toString(),
+    instructions: opener.ok
+      ? "已在本机弹出受控浏览器窗口（插件自己的 profile，不是你的日常浏览器）：登录 Meoo 并点一次「授权」即可。这个窗口里的登录态会保留，插件的每日签到也用它。账号下有多个项目时，回调页会让你选一个。"
+      : "在浏览器登录 Meoo 并点一次「授权」后会自动返回此处；身份与 AI 服务 AK 自动解析。账号下有多个项目时，回调页会列出项目让你选一个。",
     method: "auto",
     async callback() {
-      return await done
+      try {
+        return await done
+      } finally {
+        await opener.close()
+      }
     },
   }
 }
@@ -806,8 +952,79 @@ function persistOf(ctx) {
   }
 }
 
+const PANEL_STATE_FILE = new URL("./panel/state.js", import.meta.url)
+let panelPublisherStarted = false
+
+/**
+ * 登录态到期报告：面板和「概览」里的用量卡片共用，带缓存和等待上限。
+ * - 宿主是 Bun 时读 bun:sqlite，毫秒级；没有 sqlite 才退回受控浏览器（慢）
+ * - 卡片最多等 waitMs，超时先给旧值，绝不卡住概览
+ */
+let expiryCache = null
+let expiryCacheAt = 0
+let expiryInflight = null
+
+async function expiryReport({ maxAgeMs = 5 * 60 * 1000, waitMs = 1500 } = {}) {
+  if (process.env.MEOO_EXPIRY === "0") return null
+  if (expiryCache && Date.now() - expiryCacheAt < maxAgeMs) return expiryCache
+  if (!expiryInflight) {
+    expiryInflight = (async () => {
+      let report = await cookieExpiry()
+      if (!report.ok && report.reason === "NO_SQLITE") {
+        try {
+          report = await cookieExpiryViaBrowser()
+        } catch {}
+      }
+      expiryCache = report
+      expiryCacheAt = Date.now()
+      return report
+    })().finally(() => {
+      expiryInflight = null
+    })
+  }
+  const pending = expiryInflight.catch(() => null)
+  return await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve(expiryCache), waitMs))])
+}
+
+/** 把「登录态还剩多久」写进面板目录：面板没有网络，只能读插件自己的文件。 */
+async function publishPanelState() {
+  if (process.env.MEOO_PANEL_STATE === "0") return
+  try {
+    const report = await expiryReport({ maxAgeMs: 0, waitMs: 5000 })
+    if (!report) return
+    const view = report.ok
+      ? {
+          ...report,
+          atText: formatLocal(report.at),
+          sessionExpiresText: formatLocal(report.sessionExpiresAt),
+          sessionRemainText: report.sessionMsLeft == null ? "会话" : formatRemain(report.sessionMsLeft),
+          cookies: report.cookies.map((c) => ({
+            ...c,
+            expiresText: formatLocal(c.expiresAt),
+            remainText: c.msLeft == null ? "会话" : formatRemain(c.msLeft),
+          })),
+        }
+      : { ...report, atText: formatLocal(report.at) }
+    writeFileSync(fileURLToPath(PANEL_STATE_FILE), `globalThis.__MEOO_SESSION__ = ${JSON.stringify(view)}\n`)
+  } catch {}
+}
+
+/** 宿主启动（或打开设置）时写一次，之后每 30 分钟刷新；不启动浏览器，开销可忽略。 */
+function startPanelStatePublisher() {
+  if (panelPublisherStarted) return
+  panelPublisherStarted = true
+  publishPanelState()
+  const timer = setInterval(publishPanelState, 30 * 60 * 1000)
+  timer.unref?.()
+}
+
 export const MeooAuthPlugin = async ({ client }) => {
   const ctx = { client }
+
+  // 面板数据：面板跑在沙盒里（connect-src 'none'，没有网络），只能读插件自己的文件，
+  // 所以由插件把「登录态还剩多久」写成 panel/state.js 递进去。
+  // 读 Cookies 库取 expires_utc，不解密、不启动浏览器。
+  startPanelStatePublisher()
 
   return {
     config: async (config) => {
@@ -857,6 +1074,14 @@ export const MeooAuthPlugin = async ({ client }) => {
           ...(a.serviceAk ? { serviceAk: a.serviceAk, serviceAkProjectId: a.serviceAkProjectId, projectUrlId: a.projectUrlId, apiBase: a.apiBase } : {}),
         }
       },
+      // 每日签到：Meoo 的每日 2000 积分走网页端 /api/mc/entitlement/init，只认
+      // meoo.com 的网页会话 cookie（cli.compat 的 token 打进去是 401 NEED_LOGIN）。
+      // 用受控浏览器（登录时那个 profile）在页面里发请求；没登录过就返回 failed 并说明。
+      async checkin() {
+        const result = await checkinViaWeb()
+        publishPanelState() // 签到会刷 cookie，顺手把面板数据更新掉
+        return result
+      },
       // 余额：Meoo 的积分账户（控制面 /account/points）。预付费钱包按 magpie 的
       // balance 窗口显示——这种窗口不写 used/limit，卡片显示数字而不是百分比条；
       // 再补一条「已用」和最近一批到期日，免得只看得到余额看不到花在哪。
@@ -882,6 +1107,17 @@ export const MeooAuthPlugin = async ({ client }) => {
         const windows = [wallet]
         if (used > 0) windows.push({ name: "已用", display: `${fmt(used)} 积分`, aside: true })
         if (frozen > 0) windows.push({ name: "冻结", display: `${fmt(frozen)} 积分`, aside: true })
+        // 概览卡片上的登录态：受控浏览器里 6 个鉴权 cookie 还剩多久。
+        // 读 Cookies 库取 expires_utc（不解密、通常不起浏览器），最多等 1.5 秒。
+        const expiry = await expiryReport()
+        if (expiry?.ok) {
+          const expired = expiry.sessionMsLeft != null && expiry.sessionMsLeft <= 0
+          const head = expired ? "已过期" : `还剩 ${formatRemain(expiry.sessionMsLeft)}`
+          const tail = expiry.missing?.length
+            ? `缺 ${expiry.missing.join("/")}`
+            : `${formatLocal(expiry.sessionExpiresAt)} 到期`
+          windows.push({ name: "登录态", display: `${head}（${tail}）`, aside: true })
+        }
         return { user: a.username || "", balance: `${fmt(left)} 积分`, windows }
       },
       async loader(getAuth) {

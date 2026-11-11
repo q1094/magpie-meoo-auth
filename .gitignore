@@ -1,4 +1,5 @@
 node_modules/
 *.tgz
 .work/
+panel/state.js
 

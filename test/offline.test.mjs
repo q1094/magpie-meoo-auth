@@ -2,7 +2,13 @@
 // 覆盖：模型目录解析、AK 三种登录路径、项目选择、续期、loader/config 契约。
 import test from "node:test"
 import assert from "node:assert/strict"
-import { MeooAuthPlugin, _internal } from "../index.mjs"
+
+// 测试里绝不允许真去启动 Chrome（browserSignIn 会走受控浏览器），也别往源码目录写面板数据
+process.env.MEOO_NO_BROWSER = "1"
+process.env.MEOO_PANEL_STATE = "0"
+process.env.MEOO_EXPIRY = "0"
+
+const { MeooAuthPlugin, _internal } = await import("../index.mjs")
 
 const {
   parseGatewayModels,
@@ -587,7 +593,7 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期）", asyn
   const { hooks } = await plugin(fakeClient())
   const auth = {
     type: "oauth", apiBase: "https://meoo.test", access: "acc-1", refresh: "ref-1",
-    expires: Date.now() + 3600_000, username: "Fishundersea",
+    expires: Date.now() + 3600_000, username: "meoo-user",
   }
   const points = {
     data: {
@@ -605,7 +611,7 @@ test("usage：积分按钱包窗口给出（余额/已用/最近到期）", asyn
   }
   await withFetch(async (mock) => {
     const u = await hooks.auth.usage(async () => auth)
-    assert.equal(u.user, "Fishundersea")
+    assert.equal(u.user, "meoo-user")
     assert.equal(u.balance, "58,848 积分")
     // 钱包窗口：balance + unit（新宿主），同时带 display（旧宿主当纯文本窗口）
     assert.deepEqual(u.windows[0], { name: "积分", balance: 58848, unit: "积分", display: "58,848 积分", runsOutAt: "2026-11-10" })
@@ -687,6 +693,119 @@ test("browserSignIn：授权被拒 → failed；回调服务器会收尾", async
     const result = await m.callback()
     assert.equal(result.type, "failed")
     assert.match(result.error, /授权被取消/)
+  } finally {
+    globalThis.fetch = prev
+    delete process.env.MEOO_MAIN_SITE_URL
+  }
+})
+
+const pendingOr = (p, ms = 30) =>
+  Promise.race([p.then(() => "settled"), new Promise((r) => setTimeout(() => r("pending"), ms))])
+
+test("browserSignIn：账号下多个项目 → 回调页给选择表单，POST 选中的项目后完成登录", async () => {
+  process.env.MEOO_GATEWAY_BASE_URL = GATEWAY
+  process.env.MEOO_MAIN_SITE_URL = "https://meoo.test"
+  const backend = meooBackend({
+    identity: { name: "陈同学", user_id: "u1", project_url_id: null },
+    projects: [
+      { url_id: "proj-a", name: "功能简介" },
+      { url_id: "proj-b", name: "AI能力展示" },
+    ],
+    env: { meooProjectApiKey: "meoo_pick_v1.bbb" },
+    gatewayModels: [{ id: "glm-5.2" }],
+  })
+  const prev = globalThis.fetch
+  globalThis.fetch = backend
+  try {
+    const m = await browserSignIn(60_000)
+    const url = new URL(m.url)
+    const redirect = url.searchParams.get("redirect_uri")
+    const state = url.searchParams.get("state")
+
+    // 回调：不是报错，而是给一张带项目清单的选择页
+    const page = await prev(`${redirect}?code=the-code&state=${encodeURIComponent(state)}`)
+    assert.equal(page.status, 200)
+    assert.match(page.headers.get("content-type"), /text\/html/)
+    const html = await page.text()
+    assert.match(html, /选择一个项目/)
+    assert.match(html, /value="proj-a"/)
+    assert.match(html, /value="proj-b"/)
+    assert.match(html, /AI能力展示/)
+    assert.equal(await pendingOr(m.callback()), "pending", "选项目之前不能有结果")
+
+    // 刷新选择页不该被当成重复回调
+    const again = await prev(`${redirect}?code=the-code&state=${encodeURIComponent(state)}`)
+    assert.equal(again.status, 200)
+    assert.match(await again.text(), /选择一个项目/)
+
+    // 空提交 → 留在选择页并提示
+    const empty = await prev(redirect, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ state }).toString(),
+    })
+    assert.equal(empty.status, 200)
+    assert.match(await empty.text(), /请先在列表里选一个项目/)
+
+    // 选 proj-b → 用这个项目取 AK，登录完成
+    const posted = await prev(redirect, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ state, project: "proj-b" }).toString(),
+    })
+    assert.equal(posted.status, 200)
+    assert.match(await posted.text(), /proj-b/)
+    const result = await m.callback()
+    assert.equal(result.type, "success", JSON.stringify(result))
+    assert.equal(result.projectUrlId, "proj-b")
+    assert.equal(result.serviceAk, "meoo_pick_v1.bbb")
+    assert.equal(result.username, "陈同学")
+    assert.match(
+      backend.calls.map((c) => c.url).join("\n"),
+      /projects\/proj-b\/cloud\/environment/,
+      "AK 应该按选中的项目去取",
+    )
+  } finally {
+    globalThis.fetch = prev
+    delete process.env.MEOO_MAIN_SITE_URL
+  }
+})
+
+test("browserSignIn：选中的项目取不到 AK（没开云服务）→ 留在选择页并显示原因", async () => {
+  process.env.MEOO_GATEWAY_BASE_URL = GATEWAY
+  process.env.MEOO_MAIN_SITE_URL = "https://meoo.test"
+  const backend = meooBackend({
+    identity: { name: "陈同学", user_id: "u1", project_url_id: null },
+    projects: [
+      { url_id: "proj-a", name: "功能简介" },
+      { url_id: "proj-b", name: "空项目" },
+    ],
+    env: {},
+    cloudPosted: false,
+  })
+  const prev = globalThis.fetch
+  globalThis.fetch = backend
+  try {
+    const m = await browserSignIn(1500)
+    const url = new URL(m.url)
+    const redirect = url.searchParams.get("redirect_uri")
+    const state = url.searchParams.get("state")
+    await prev(`${redirect}?code=the-code&state=${encodeURIComponent(state)}`)
+
+    const posted = await prev(redirect, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ state, custom: "proj-b" }).toString(),
+    })
+    assert.equal(posted.status, 200)
+    const html = await posted.text()
+    assert.match(html, /没能取到 AK/)
+    assert.match(html, /value="proj-a"/, "换一个项目还能继续选")
+    assert.equal(await pendingOr(m.callback(), 40), "pending", "取 AK 失败不结束本次登录")
+    // 不选就一直等到超时：这时才收尾并把服务器关掉
+    const expired = await m.callback()
+    assert.equal(expired.type, "failed")
+    assert.match(expired.error, /超时/)
   } finally {
     globalThis.fetch = prev
     delete process.env.MEOO_MAIN_SITE_URL
